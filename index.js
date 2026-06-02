@@ -244,6 +244,26 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
+// [수정사항 2026-06-02] 6. "해주세요" (TODO) 추가 시 텔레그램 푸시 알림 발송 API
+app.post('/api/notify-todo', (req, res) => {
+    try {
+        const { text, priority, creator, date } = req.body;
+        
+        let priorityText = '';
+        if (priority === 'high') priorityText = '[🚨긴급] ';
+        else if (priority === 'normal') priorityText = '[📦주문] ';
+        else priorityText = '[💬기타] ';
+
+        const msg = `🔔 <b>새로운 "해주세요" 등록</b>\n\n👤 <b>${creator || '담당자'}</b>님이 새로운 요청을 남겼습니다.\n\n${priorityText}<b>${text}</b>\n\n🕒 ${date}`;
+        sendTelegramMessage(msg);
+        
+        res.json({ success: true, message: '알림이 전송되었습니다.' });
+    } catch (error) {
+        console.error('Error sending todo notification:', error);
+        res.status(500).json({ error: '알림 전송에 실패했습니다.' });
+    }
+});
+
 app.get('/', (req, res) => {
     res.send('TMStock API Server is running. 🚀');
 });
