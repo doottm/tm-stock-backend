@@ -95,7 +95,17 @@ async function loadSheets() {
     if (!productsSheet || !movementsSheet) {
         throw new Error("필요한 시트('품목 및 재고', '재고 변동 히스토리')를 찾을 수 없습니다.");
     }
-    return { productsSheet, movementsSheet };
+
+    // [수정사항 2026-06-08] 해주세요(TODO) 탭 로드 및 자동 생성
+    let todosSheet = doc.sheetsByTitle['해주세요'];
+    if (!todosSheet) {
+        todosSheet = await doc.addSheet({
+            title: '해주세요',
+            headerValues: ['ID', 'Text', 'Priority', 'Creator', 'CreatedAt', 'Completed', 'Status', 'DeletedAt']
+        });
+    }
+    
+    return { productsSheet, movementsSheet, todosSheet };
 }
 
 // [수정사항 2026-05-19] 품목에 Last_Updated 가져오기 추가
@@ -244,11 +254,62 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// [수정사항 2026-06-02] 6. "해주세요" (TODO) 추가 시 텔레그램 푸시 알림 발송 API
-app.post('/api/notify-todo', (req, res) => {
+// [수정사항 2026-06-08] 6. "해주세요" (TODO) 공용 시트 연동 API 추가
+app.get('/api/todos', async (req, res) => {
     try {
-        const { text, priority, creator, date } = req.body;
+        const { todosSheet } = await loadSheets();
+        const rows = await todosSheet.getRows();
         
+        const now = new Date();
+        const todos = [];
+        
+        for (const row of rows) {
+            const status = row.get('Status') || 'Active';
+            const deletedAtStr = row.get('DeletedAt');
+            
+            // 30일 경과된 휴지통 항목은 스킵
+            if (status === 'Trash' && deletedAtStr) {
+                const deletedAt = new Date(deletedAtStr);
+                const diffTime = Math.abs(now - deletedAt);
+                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                if (diffDays > 30) continue;
+            }
+            
+            todos.push({
+                id: row.get('ID'),
+                text: row.get('Text'),
+                priority: row.get('Priority'),
+                creator: row.get('Creator'),
+                createdAt: parseInt(row.get('CreatedAt')),
+                completed: row.get('Completed') === 'TRUE',
+                status: status,
+                deletedAt: deletedAtStr || ''
+            });
+        }
+        res.json(todos);
+    } catch (error) {
+        console.error('Error fetching todos:', error);
+        res.status(500).json({ error: '데이터를 불러오는데 실패했습니다.' });
+    }
+});
+
+app.post('/api/todos', async (req, res) => {
+    try {
+        const { id, text, priority, creator, createdAt, date } = req.body;
+        
+        const { todosSheet } = await loadSheets();
+        await todosSheet.addRow({
+            ID: id,
+            Text: text,
+            Priority: priority,
+            Creator: creator,
+            CreatedAt: createdAt,
+            Completed: 'FALSE',
+            Status: 'Active',
+            DeletedAt: ''
+        });
+        
+        // 텔레그램 알림
         let priorityText = '';
         if (priority === 'high') priorityText = '[🚨긴급] ';
         else if (priority === 'normal') priorityText = '[📦주문] ';
@@ -257,10 +318,42 @@ app.post('/api/notify-todo', (req, res) => {
         const msg = `🔔 <b>새로운 "해주세요" 등록</b>\n\n👤 <b>${creator || '담당자'}</b>님이 새로운 요청을 남겼습니다.\n\n${priorityText}<b>${text}</b>\n\n🕒 ${date}`;
         sendTelegramMessage(msg);
         
-        res.json({ success: true, message: '알림이 전송되었습니다.' });
+        res.json({ success: true, message: '요청사항이 추가되었습니다.' });
     } catch (error) {
-        console.error('Error sending todo notification:', error);
-        res.status(500).json({ error: '알림 전송에 실패했습니다.' });
+        console.error('Error posting todo:', error);
+        res.status(500).json({ error: '요청사항 추가에 실패했습니다.' });
+    }
+});
+
+app.put('/api/todos/:id', async (req, res) => {
+    try {
+        const todoId = req.params.id;
+        const { completed, status } = req.body;
+        
+        const { todosSheet } = await loadSheets();
+        const rows = await todosSheet.getRows();
+        
+        const row = rows.find(r => r.get('ID') === String(todoId));
+        if (row) {
+            if (completed !== undefined) {
+                row.set('Completed', completed ? 'TRUE' : 'FALSE');
+            }
+            if (status !== undefined) {
+                row.set('Status', status);
+                if (status === 'Trash') {
+                    row.set('DeletedAt', new Date().toISOString());
+                } else if (status === 'Active') {
+                    row.set('DeletedAt', '');
+                }
+            }
+            await row.save();
+            res.json({ success: true, message: '상태가 업데이트되었습니다.' });
+        } else {
+            res.status(404).json({ error: '항목을 찾을 수 없습니다.' });
+        }
+    } catch (error) {
+        console.error('Error updating todo:', error);
+        res.status(500).json({ error: '상태 업데이트에 실패했습니다.' });
     }
 });
 
