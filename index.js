@@ -226,6 +226,78 @@ app.post('/api/movements', async (req, res) => {
     }
 });
 
+// [수정사항 2026-06-15] 최근 재고 변동 내역 조회 API 추가 (오늘, 3일, 1주일 필터)
+app.get('/api/movements', async (req, res) => {
+    try {
+        const days = req.query.days !== undefined ? parseInt(req.query.days) : 7;
+        const { movementsSheet, productsSheet } = await loadSheets();
+        
+        // 1. 제품명 -> 거래처(Supplier) 매핑 생성
+        const productRows = await productsSheet.getRows();
+        const supplierMap = {};
+        productRows.forEach(r => {
+            const name = r.get('Item_Name');
+            const supplier = r.get('Supplier');
+            if (name) {
+                supplierMap[name] = supplier || '-';
+            }
+        });
+        
+        // 2. 이동 기록 가져오기
+        const movementRows = await movementsSheet.getRows();
+        
+        // 3. KST (UTC+9) 기준 날짜 필터링 기준일 계산
+        const nowKst = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
+        const cutoffKst = new Date(nowKst);
+        if (days === 0) {
+            cutoffKst.setUTCHours(0, 0, 0, 0);
+        } else {
+            cutoffKst.setUTCDate(cutoffKst.getUTCDate() - days);
+            cutoffKst.setUTCHours(0, 0, 0, 0);
+        }
+        const cutoff = new Date(cutoffKst.getTime() - 9 * 60 * 60 * 1000);
+        
+        const movements = [];
+        // 최신 업데이트가 아래에 쌓이므로 역순(최신순)으로 탐색
+        for (let i = movementRows.length - 1; i >= 0; i--) {
+            const row = movementRows[i];
+            const dateStr = row.get('date') || '';
+            const createdAtStr = row.get('created_at') || dateStr;
+            
+            let itemDate = null;
+            if (createdAtStr) {
+                if (createdAtStr.includes('T') && createdAtStr.endsWith('Z')) {
+                    itemDate = new Date(createdAtStr);
+                } else {
+                    const cleanDateStr = createdAtStr.replace(' ', 'T');
+                    itemDate = new Date(cleanDateStr.includes('+') ? cleanDateStr : cleanDateStr + '+09:00');
+                }
+            }
+            
+            if (!itemDate || isNaN(itemDate.getTime())) continue;
+            
+            // 기준일 이전 데이터면 건너뜀
+            if (itemDate < cutoff) continue;
+            
+            const itemName = row.get('item_name') || '';
+            movements.push({
+                date: dateStr,
+                sku: row.get('sku') || '',
+                item_name: itemName,
+                type: row.get('type') || '',
+                quantity: parseFloat(row.get('quantity')) || 0,
+                worker: row.get('worker') || '',
+                supplier: supplierMap[itemName] || '-'
+            });
+        }
+        
+        res.json(movements);
+    } catch (error) {
+        console.error('Error fetching movements:', error);
+        res.status(500).json({ error: '데이터를 불러오는데 실패했습니다.', details: error.message });
+    }
+});
+
 // [수정사항 2026-05-19] 5. 사용자 로그인 API 추가
 app.post('/api/login', async (req, res) => {
     try {
