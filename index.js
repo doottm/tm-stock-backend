@@ -97,12 +97,22 @@ async function loadSheets() {
     }
 
     // [수정사항 2026-06-08] 해주세요(TODO) 탭 로드 및 자동 생성
+    // [수정사항 2026-06-17] Confirm, Progress 컬럼 추가 및 기존 시트 헤더 마이그레이션
     let todosSheet = doc.sheetsByTitle['해주세요'];
     if (!todosSheet) {
         todosSheet = await doc.addSheet({
             title: '해주세요',
-            headerValues: ['ID', 'Text', 'Priority', 'Creator', 'CreatedAt', 'Completed', 'Status', 'DeletedAt']
+            headerValues: ['ID', 'Text', 'Priority', 'Creator', 'CreatedAt', 'Completed', 'Status', 'DeletedAt', 'Confirm', 'Progress']
         });
+    } else {
+        await todosSheet.loadHeaderRow();
+        const headers = todosSheet.headerValues || [];
+        if (!headers.includes('Confirm') || !headers.includes('Progress')) {
+            const newHeaders = [...headers];
+            if (!newHeaders.includes('Confirm')) newHeaders.push('Confirm');
+            if (!newHeaders.includes('Progress')) newHeaders.push('Progress');
+            await todosSheet.setHeaderRow(newHeaders);
+        }
     }
     
     return { productsSheet, movementsSheet, todosSheet };
@@ -327,6 +337,7 @@ app.post('/api/login', async (req, res) => {
 });
 
 // [수정사항 2026-06-08] 6. "해주세요" (TODO) 공용 시트 연동 API 추가
+// [수정사항 2026-06-17] 30일 경과된 휴지통 항목 물리 삭제 및 Confirm/Progress 조회 추가
 app.get('/api/todos', async (req, res) => {
     try {
         const { todosSheet } = await loadSheets();
@@ -334,17 +345,21 @@ app.get('/api/todos', async (req, res) => {
         
         const now = new Date();
         const todos = [];
+        const rowsToDelete = [];
         
         for (const row of rows) {
             const status = row.get('Status') || 'Active';
             const deletedAtStr = row.get('DeletedAt');
             
-            // 30일 경과된 휴지통 항목은 스킵
+            // 30일 경과된 휴지통 항목 수집
             if (status === 'Trash' && deletedAtStr) {
                 const deletedAt = new Date(deletedAtStr);
                 const diffTime = Math.abs(now - deletedAt);
                 const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-                if (diffDays > 30) continue;
+                if (diffDays > 30) {
+                    rowsToDelete.push(row);
+                    continue;
+                }
             }
             
             todos.push({
@@ -355,9 +370,21 @@ app.get('/api/todos', async (req, res) => {
                 createdAt: parseInt(row.get('CreatedAt')),
                 completed: row.get('Completed') === 'TRUE',
                 status: status,
-                deletedAt: deletedAtStr || ''
+                deletedAt: deletedAtStr || '',
+                confirm: row.get('Confirm') || '확인',
+                progress: row.get('Progress') || '진행중'
             });
         }
+
+        // 30일 경과된 휴지통 항목 영구 삭제 (역순으로 안전하게 진행)
+        for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+            try {
+                await rowsToDelete[i].delete();
+            } catch (err) {
+                console.error('Failed to permanently delete old trash row:', err);
+            }
+        }
+
         res.json(todos);
     } catch (error) {
         console.error('Error fetching todos:', error);
@@ -365,6 +392,7 @@ app.get('/api/todos', async (req, res) => {
     }
 });
 
+// [수정사항 2026-06-17] Confirm, Progress 컬럼 기본값 ('확인', '진행중') 세팅 추가
 app.post('/api/todos', async (req, res) => {
     try {
         const { id, text, priority, creator, createdAt, date } = req.body;
@@ -378,7 +406,9 @@ app.post('/api/todos', async (req, res) => {
             CreatedAt: createdAt,
             Completed: 'FALSE',
             Status: 'Active',
-            DeletedAt: ''
+            DeletedAt: '',
+            Confirm: '확인',
+            Progress: '진행중'
         });
         
         // 텔레그램 알림
@@ -397,10 +427,11 @@ app.post('/api/todos', async (req, res) => {
     }
 });
 
+// [수정사항 2026-06-17] confirm, progress 개별 업데이트 및 상호 동기화 추가
 app.put('/api/todos/:id', async (req, res) => {
     try {
         const todoId = req.params.id;
-        const { completed, status } = req.body;
+        const { completed, status, confirm, progress } = req.body;
         
         const { todosSheet } = await loadSheets();
         const rows = await todosSheet.getRows();
@@ -409,6 +440,8 @@ app.put('/api/todos/:id', async (req, res) => {
         if (row) {
             if (completed !== undefined) {
                 row.set('Completed', completed ? 'TRUE' : 'FALSE');
+                // Completed 여부에 맞춰 Progress 상태 자동 동기화
+                row.set('Progress', completed ? '완료' : '진행중');
             }
             if (status !== undefined) {
                 row.set('Status', status);
@@ -416,6 +449,18 @@ app.put('/api/todos/:id', async (req, res) => {
                     row.set('DeletedAt', new Date().toISOString());
                 } else if (status === 'Active') {
                     row.set('DeletedAt', '');
+                }
+            }
+            if (confirm !== undefined) {
+                row.set('Confirm', confirm);
+            }
+            if (progress !== undefined) {
+                row.set('Progress', progress);
+                // Progress 상태에 맞춰 Completed 여부 자동 동기화
+                if (progress === '완료') {
+                    row.set('Completed', 'TRUE');
+                } else if (progress === '진행중') {
+                    row.set('Completed', 'FALSE');
                 }
             }
             await row.save();
