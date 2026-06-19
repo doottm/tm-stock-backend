@@ -7,6 +7,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
+const http = require('http');
+const ws = require('ws');
+const { google } = require('googleapis');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 
@@ -478,6 +481,270 @@ app.get('/', (req, res) => {
     res.send('TMStock API Server is running. 🚀');
 });
 
-app.listen(PORT, () => {
+// ==========================================================================
+// Real-Time Face-to-Face Translation Integrations (Ported from AG_Translation)
+// ==========================================================================
+
+// Google Sheets Logging Route for Translation Logs
+// [수정사항 2026-06-20] Sheet1 하드코딩 → '통역기록' 시트 자동 생성 방식으로 변경
+app.post('/api/log', async (req, res) => {
+  const { staffScript, customerScript, targetLanguage } = req.body;
+
+  // Gracefully handle missing credentials without crashing
+  if (!doc) {
+    console.warn('[Google Sheets] Missing GOOGLE_SHEET_ID. Log saved only in server console.');
+    return res.status(200).json({
+      success: false,
+      warning: 'Google Sheets not configured. Saved to server logs instead.',
+      data: { staffScript, customerScript, targetLanguage }
+    });
+  }
+
+  try {
+    await doc.loadInfo();
+
+    // '통역기록' 시트가 없으면 자동 생성
+    let logSheet = doc.sheetsByTitle['통역기록'];
+    if (!logSheet) {
+      logSheet = await doc.addSheet({
+        title: '통역기록',
+        headerValues: ['Timestamp', 'Staff_Script', 'Customer_Script', 'Language']
+      });
+      console.log('[Google Sheets] Created new sheet: 통역기록');
+    }
+
+    // 로그 행 추가
+    const timestamp = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
+    await logSheet.addRow({
+      Timestamp: timestamp,
+      Staff_Script: staffScript || '',
+      Customer_Script: customerScript || '',
+      Language: targetLanguage || ''
+    });
+
+    console.log('[Google Sheets] Translation log appended to 통역기록 sheet.');
+    return res.json({ success: true, message: '상담 기록이 구글 시트 [통역기록] 탭에 저장되었습니다.' });
+  } catch (error) {
+    console.error('[Google Sheets] Error logging to sheets:', error);
+    return res.status(500).json({ 
+      success: false, 
+      error: 'Failed to save log to Google Sheets.',
+      details: error.message 
+    });
+  }
+});
+
+// REST Text Translation Endpoint for Quick Phrases (canned phrases)
+app.post('/api/translate', async (req, res) => {
+  const { text, targetLanguage } = req.body;
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) {
+    console.error('[Translation API] GEMINI_API_KEY is not defined');
+    return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on server' });
+  }
+
+  try {
+    const model = 'gemini-2.5-flash';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+    
+    console.log(`[Translation API] Request: Translate "${text}" to "${targetLanguage}"`);
+    
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{
+            text: `Translate the following Korean text into language code "${targetLanguage}". Return ONLY the translation, without any introduction, quotes, explanations, or extra text.\n\nText: ${text}`
+          }]
+        }]
+      })
+    });
+
+    const data = await response.json();
+    
+    if (!response.ok) {
+      console.error('[Translation API] Gemini API responded with error:', response.status, JSON.stringify(data));
+      return res.status(response.status).json({ 
+        error: 'Gemini API call failed', 
+        status: response.status,
+        details: data 
+      });
+    }
+
+    if (!data.candidates || data.candidates.length === 0) {
+      console.warn('[Translation API] No translation candidates returned. Full Response:', JSON.stringify(data));
+      return res.json({ translatedText: text, warning: 'No candidates returned from Gemini' });
+    }
+
+    let translatedText = data.candidates[0].content?.parts?.[0]?.text?.trim();
+    if (!translatedText) {
+      console.warn('[Translation API] Candidate text is empty. Full Response:', JSON.stringify(data));
+      translatedText = text;
+    }
+    
+    // Clean up any double quotes Gemini might wrap the text with
+    if (translatedText.startsWith('"') && translatedText.endsWith('"')) {
+      translatedText = translatedText.slice(1, -1);
+    }
+    
+    console.log(`[Translation API] Successfully translated "${text}" to "${translatedText}" (${targetLanguage})`);
+    res.json({ translatedText });
+  } catch (err) {
+    console.error('[Translation API] Exception occurred:', err);
+    res.status(500).json({ error: 'Translation failed due to exception', details: err.message });
+  }
+});
+
+// Create HTTP Server wrapped with Express
+const server = http.createServer(app);
+
+// Attach WebSocket Server to HTTP server
+const wss = new ws.WebSocketServer({ noServer: true });
+
+// Handle WebSocket upgrade on /ws
+server.on('upgrade', (request, socket, head) => {
+  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  if (url.pathname === '/ws') {
+    wss.handleUpgrade(request, socket, head, (wsConnection) => {
+      wss.emit('connection', wsConnection, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+// WebSocket Server Connection Handler (Gemini Live Proxy)
+wss.on('connection', (clientWs, req) => {
+  console.log('[WebSocket] Client connected.');
+
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) {
+    console.error('[WebSocket] GEMINI_API_KEY is not defined in environment variables.');
+    clientWs.close(1008, 'GEMINI_API_KEY is missing on server');
+    return;
+  }
+
+  // Connect to Google Gemini Live API
+  const geminiUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${geminiKey}`;
+  const geminiWs = new ws.WebSocket(geminiUrl);
+
+  let isGeminiOpen = false;
+  const messageQueue = [];
+
+  geminiWs.on('open', () => {
+    console.log('[WebSocket] Connected to Gemini Live API upstream.');
+    isGeminiOpen = true;
+
+    // Send any messages queued while connection was establishing
+    while (messageQueue.length > 0) {
+      const msg = messageQueue.shift();
+      geminiWs.send(msg);
+    }
+  });
+
+  geminiWs.on('message', (data, isBinary) => {
+    // Forward message from Gemini to Client
+    if (clientWs.readyState === ws.WebSocket.OPEN) {
+      try {
+        const response = JSON.parse(data);
+        if (response.serverContent) {
+          const keys = Object.keys(response.serverContent);
+          console.log(`[WebSocket] Received from Gemini: serverContent with keys: [${keys.join(', ')}]`);
+          
+          if (response.serverContent.inputTranscription && response.serverContent.inputTranscription.text !== undefined) {
+            console.log(`[WebSocket] Gemini Input Transcript: "${response.serverContent.inputTranscription.text}"`);
+          }
+          if (response.serverContent.outputTranscription && response.serverContent.outputTranscription.text !== undefined) {
+            console.log(`[WebSocket] Gemini Output Transcript: "${response.serverContent.outputTranscription.text}"`);
+          }
+          
+          if (response.serverContent.modelTurn) {
+            const parts = response.serverContent.modelTurn.parts;
+            if (parts) {
+              parts.forEach((part, index) => {
+                const partKeys = Object.keys(part);
+                console.log(`  -> Part ${index} keys: [${partKeys.join(', ')}]`);
+                if (part.text) {
+                  console.log(`  -> Part ${index} text: "${part.text}"`);
+                }
+                if (part.inlineData) {
+                  console.log(`  -> Part ${index} inlineData: mimeType="${part.inlineData.mimeType}", length=${part.inlineData.data.length} chars`);
+                }
+              });
+            }
+          }
+        } else {
+          console.log('[WebSocket] Received from Gemini (non-serverContent):', Object.keys(response));
+        }
+      } catch (e) {
+        console.log('[WebSocket] Error parsing Gemini message or binary message');
+      }
+      
+      // Ensure we forward text messages as strings so the client browser receives them as strings
+      clientWs.send(isBinary ? data : data.toString('utf-8'));
+    }
+  });
+
+  geminiWs.on('close', (code, reason) => {
+    console.log(`[WebSocket] Gemini upstream closed. Code: ${code}, Reason: ${reason}`);
+    
+    // WS specification restricts sending certain local close codes (e.g. 1005, 1006, 1015)
+    const safeCode = (code >= 1000 && code <= 1011 && code !== 1004 && code !== 1005 && code !== 1006) ? code : 1000;
+    const safeReason = reason ? reason.toString().substring(0, 100) : '';
+    
+    if (clientWs.readyState === ws.WebSocket.OPEN || clientWs.readyState === ws.WebSocket.CONNECTING) {
+      clientWs.close(safeCode, safeReason);
+    }
+  });
+
+  geminiWs.on('error', (err) => {
+    console.error('[WebSocket] Gemini upstream error:', err);
+    clientWs.close(1011, 'Internal connection error to upstream');
+  });
+
+  // Client messages
+  clientWs.on('message', (message) => {
+    if (isGeminiOpen) {
+      if (geminiWs.readyState === ws.WebSocket.OPEN) {
+        try {
+          const parsed = JSON.parse(message);
+          if (parsed.realtimeInput && parsed.realtimeInput.mediaChunks) {
+            const dataLength = parsed.realtimeInput.mediaChunks[0].data.length;
+            console.log(`[WebSocket] Received audio chunk: ${dataLength} base64 chars`);
+          } else {
+            console.log('[WebSocket] Received non-audio payload:', Object.keys(parsed));
+          }
+        } catch (e) {
+          console.log('[WebSocket] Received binary/non-JSON message');
+        }
+        geminiWs.send(message);
+      }
+    } else {
+      // Queue message until Gemini connection is open
+      messageQueue.push(message);
+    }
+  });
+
+  clientWs.on('close', () => {
+    console.log('[WebSocket] Client disconnected.');
+    if (geminiWs.readyState === ws.WebSocket.OPEN || geminiWs.readyState === ws.WebSocket.CONNECTING) {
+      geminiWs.close();
+    }
+  });
+
+  clientWs.on('error', (err) => {
+    console.error('[WebSocket] Client WebSocket error:', err);
+    if (geminiWs.readyState === ws.WebSocket.OPEN || geminiWs.readyState === ws.WebSocket.CONNECTING) {
+      geminiWs.close();
+    }
+  });
+});
+
+// Start Server
+server.listen(PORT, () => {
     console.log(`🚀 Server is running on http://localhost:${PORT}`);
+    console.log(`🔌 WebSocket server is active on ws://localhost:${PORT}/ws`);
 });
