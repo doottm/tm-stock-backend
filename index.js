@@ -829,6 +829,16 @@ wss.on('connection', (clientWs, req) => {
 
   // Client messages
   clientWs.on('message', (message) => {
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed && parsed.type === 'ping') {
+        clientWs.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+    } catch (e) {
+      // Ignore parsing errors for binary / non-JSON data
+    }
+
     if (isGeminiOpen) {
       if (geminiWs.readyState === ws.WebSocket.OPEN) {
         try {
