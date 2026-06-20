@@ -598,6 +598,128 @@ app.post('/api/translate', async (req, res) => {
   }
 });
 
+// Google Sheets API: Get Shared Quick Phrases
+app.get('/api/phrases', async (req, res) => {
+  if (!doc) {
+    // Fallback if sheets not configured
+    return res.json([
+      { id: '1', text: '안녕하세요. 무엇을 도와드릴까요?' },
+      { id: '2', text: '이쪽에 서명해 주세요.' },
+      { id: '3', text: '여권을 보여주시겠어요?' },
+      { id: '4', text: '결제가 완료되었습니다. 감사합니다.' },
+      { id: '5', text: '잠시만 기다려 주세요.' }
+    ]);
+  }
+
+  try {
+    await doc.loadInfo();
+    let phraseSheet = doc.sheetsByTitle['자주사용하는문구'];
+    if (!phraseSheet) {
+      phraseSheet = await doc.addSheet({
+        title: '자주사용하는문구',
+        headerValues: ['ID', 'Text', 'CreatedAt']
+      });
+      // Add default phrases
+      await phraseSheet.addRows([
+        { ID: '1', Text: '안녕하세요. 무엇을 도와드릴까요?', CreatedAt: new Date().toISOString() },
+        { ID: '2', Text: '이쪽에 서명해 주세요.', CreatedAt: new Date().toISOString() },
+        { ID: '3', Text: '여권을 보여주시겠어요?', CreatedAt: new Date().toISOString() },
+        { ID: '4', Text: '결제가 완료되었습니다. 감사합니다.', CreatedAt: new Date().toISOString() },
+        { ID: '5', Text: '잠시만 기다려 주세요.', CreatedAt: new Date().toISOString() }
+      ]);
+      console.log('[Google Sheets] Created new sheet: 자주사용하는문구 and added default phrases.');
+    }
+
+    const rows = await phraseSheet.getRows();
+    const phrases = rows.map(row => ({
+      id: row.get('ID'),
+      text: row.get('Text'),
+      createdAt: row.get('CreatedAt')
+    }));
+
+    return res.json(phrases);
+  } catch (error) {
+    console.error('[Google Sheets] Error getting phrases:', error);
+    return res.status(500).json({ error: 'Failed to retrieve phrases from Google Sheets.' });
+  }
+});
+
+// Google Sheets API: Add Shared Quick Phrase
+app.post('/api/phrases', async (req, res) => {
+  const { text } = req.body;
+  if (!text || !text.trim()) {
+    return res.status(400).json({ error: 'Text is required.' });
+  }
+
+  if (!doc) {
+    return res.status(503).json({ error: 'Google Sheets not configured.' });
+  }
+
+  try {
+    await doc.loadInfo();
+    let phraseSheet = doc.sheetsByTitle['자주사용하는문구'];
+    if (!phraseSheet) {
+      phraseSheet = await doc.addSheet({
+        title: '자주사용하는문구',
+        headerValues: ['ID', 'Text', 'CreatedAt']
+      });
+    }
+
+    const rows = await phraseSheet.getRows();
+    const exists = rows.some(row => row.get('Text').trim() === text.trim());
+    if (exists) {
+      return res.status(409).json({ error: 'Phrase already exists.' });
+    }
+
+    const id = Date.now().toString() + Math.random().toString(36).substring(2, 6);
+    const createdAt = new Date().toISOString();
+    await phraseSheet.addRow({
+      ID: id,
+      Text: text.trim(),
+      CreatedAt: createdAt
+    });
+
+    console.log(`[Google Sheets] Added new phrase: ${text}`);
+    return res.json({ success: true, phrase: { id, text: text.trim(), createdAt } });
+  } catch (error) {
+    console.error('[Google Sheets] Error adding phrase:', error);
+    return res.status(500).json({ error: 'Failed to add phrase to Google Sheets.' });
+  }
+});
+
+// Google Sheets API: Delete Shared Quick Phrase
+app.post('/api/phrases/delete', async (req, res) => {
+  const { id } = req.body;
+  if (!id) {
+    return res.status(400).json({ error: 'ID is required.' });
+  }
+
+  if (!doc) {
+    return res.status(503).json({ error: 'Google Sheets not configured.' });
+  }
+
+  try {
+    await doc.loadInfo();
+    const phraseSheet = doc.sheetsByTitle['자주사용하는문구'];
+    if (!phraseSheet) {
+      return res.status(404).json({ error: 'Sheet not found.' });
+    }
+
+    const rows = await phraseSheet.getRows();
+    const rowToDelete = rows.find(row => row.get('ID') === id.toString());
+    if (rowToDelete) {
+      await rowToDelete.delete();
+      console.log(`[Google Sheets] Deleted phrase ID: ${id}`);
+      return res.json({ success: true });
+    } else {
+      return res.status(404).json({ error: 'Phrase not found.' });
+    }
+  } catch (error) {
+    console.error('[Google Sheets] Error deleting phrase:', error);
+    return res.status(500).json({ error: 'Failed to delete phrase from Google Sheets.' });
+  }
+});
+
 // Create HTTP Server wrapped with Express
 const server = http.createServer(app);
 
